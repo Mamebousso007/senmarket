@@ -1,0 +1,13 @@
+# Environnement Python
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Secrets et configuration locale : seul .env.example est versionné
+.env
+
+# Données et journaux : régénérables, jamais dans Git
+data/
+logs/
