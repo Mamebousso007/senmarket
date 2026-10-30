@@ -1,12 +1,16 @@
 """Génération des données SenMarket.
 
-Ce qui est fait :
-- generer_verite() : la « vérité », un jeu de 8 tables parfaitement cohérent, en mémoire ;
-- ecrire_brut()    : l'écriture des 8 CSV dans data/raw/date=AAAA-MM-JJ/.
-À venir : l'injection contrôlée de défauts, le bilan et le journal simulé.
+Les étapes :
+1. generer_verite()         : la « vérité », 8 tables parfaitement cohérentes, en mémoire ;
+2. injecter_defauts()       : (module defauts.py) une copie abîmée + le bilan des défauts ;
+3. journal_simule()         : un faux journal d'ingestion, dérivé des vraies données ;
+4. ecrire_brut()            : écriture dans data/raw/date=AAAA-MM-JJ/ :
+                              8 CSV + bilan_generation.csv + senmarket.log.
 
 Lancer depuis le terminal :
-    python -m senmarket.generateur --run-date 2026-10-29 --rows 10000 [--ecraser]
+    python -m senmarket.generateur --run-date 2026-10-29 --rows 10000
+    python -m senmarket.generateur --run-date 2026-10-29 --defauts tous --ecraser
+    python -m senmarket.generateur --run-date 2026-10-29 --defauts outlier --taux outlier=0.05
 
 Principes :
 - tout est vectorisé avec NumPy (pas de boucle sur les lignes), sauf les numéros de téléphone (Faker) ;
@@ -313,10 +317,44 @@ def generer_verite(run_date: str, rows: int = 10_000, jours: int = 365,
 
 
 # ---------------------------------------------------------------------------
+# Journal d'ingestion simulé
+# ---------------------------------------------------------------------------
+
+def journal_simule(tables: dict[str, pd.DataFrame], run_date: str, graine: int) -> list[str]:
+    """Faux journal d'ingestion : les nombres viennent des vraies tables, l'heure de --run-date."""
+    rng = np.random.default_rng([graine, 2])
+    instant = pd.Timestamp(run_date) + pd.Timedelta(hours=2)        # ingestion à 02:00 du matin
+    lignes = []
+
+    def ecrire(niveau, message):
+        nonlocal instant
+        instant += pd.Timedelta(seconds=int(rng.integers(1, 20)))
+        lignes.append(f"{instant:%Y-%m-%d %H:%M:%S} {niveau} ingestion: {message}")
+
+    ecrire("INFO", "début de l'ingestion")
+    for nom, df in tables.items():
+        if nom == "paiements":
+            for tentative in range(1, int(rng.integers(2, 5)) + 1):     # 2 à 4 échecs avant succès
+                ecrire("ERROR", f"échec de connexion à l'API Wave (tentative {tentative})")
+            ecrire("INFO", "connexion à l'API Wave rétablie")
+        ecrire("INFO", f"{len(df)} lignes chargées depuis {nom}.csv")
+        manquantes = int(df.isna().sum().sum())
+        if nom == "navigation":                       # client_id vide = visiteur anonyme, pas un défaut
+            manquantes -= int(df["client_id"].isna().sum())
+        if manquantes:
+            ecrire("WARN", f"{manquantes} valeurs manquantes détectées dans {nom}")
+    texte = pd.to_numeric(tables["lignes_commande"]["montant_xof"], errors="coerce").isna() \
+        & tables["lignes_commande"]["montant_xof"].notna()
+    if texte.any():
+        ecrire("WARN", f"{int(texte.sum())} montants non numériques dans lignes_commande")
+    ecrire("INFO", "fin de l'ingestion")
+    return lignes
+
+
+# ---------------------------------------------------------------------------
 # Écriture des fichiers bruts
 # ---------------------------------------------------------------------------
 
-CLES_PRIMAIRES = {nom: colonnes[0] for nom, colonnes in COLONNES.items()}
 HORODATAGES = {"date_evenement"}          # les autres colonnes date_* sont des dates sans heure
 
 
@@ -330,9 +368,12 @@ def _preparer_pour_csv(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def ecrire_brut(tables: dict[str, pd.DataFrame], run_date: str, ecraser: bool = False) -> Path:
-    """Écrit les 8 tables en CSV UTF-8 dans data/raw/date=AAAA-MM-JJ/ et renvoie ce dossier.
+def ecrire_brut(tables: dict[str, pd.DataFrame], run_date: str, ecraser: bool = False,
+                bilan: pd.DataFrame | None = None, journal: list[str] | None = None,
+                defauts_fichier: list[str] | tuple = ()) -> Path:
+    """Écrit la partition brute data/raw/date=AAAA-MM-JJ/ et renvoie son chemin.
 
+    Contenu : 8 CSV (UTF-8), bilan_generation.csv et senmarket.log (s'ils sont fournis).
     On écrit d'abord dans un dossier temporaire, puis on le renomme : en cas d'erreur
     au milieu, aucun dossier « à moitié écrit » ne reste dans data/raw/.
     """
@@ -348,9 +389,17 @@ def ecrire_brut(tables: dict[str, pd.DataFrame], run_date: str, ecraser: bool = 
     temporaire.mkdir(parents=True)
     try:
         for nom in COLONNES:
-            _preparer_pour_csv(tables[nom]).to_csv(
-                temporaire / f"{nom}.csv", index=False, encoding="utf-8", lineterminator="\n"
-            )
+            df = _preparer_pour_csv(tables[nom])
+            encodage = "utf-8"
+            if nom == "lignes_commande" and "colonne_manquante" in defauts_fichier:
+                df = df.drop(columns="quantite")              # défaut de fichier : colonne supprimée
+            if nom == "clients" and "encodage_latin1" in defauts_fichier:
+                encodage = "latin-1"                          # défaut de fichier : mauvais encodage
+            df.to_csv(temporaire / f"{nom}.csv", index=False, encoding=encodage, lineterminator="\n")
+        if bilan is not None:
+            bilan.to_csv(temporaire / "bilan_generation.csv", index=False, lineterminator="\n")
+        if journal is not None:
+            (temporaire / "senmarket.log").write_text("\n".join(journal) + "\n", encoding="utf-8")
         if destination.exists():
             shutil.rmtree(destination)
         temporaire.rename(destination)
@@ -358,7 +407,7 @@ def ecrire_brut(tables: dict[str, pd.DataFrame], run_date: str, ecraser: bool = 
         shutil.rmtree(temporaire, ignore_errors=True)
         raise
 
-    logger.info("8 fichiers CSV écrits dans %s", destination)
+    logger.info("Partition brute écrite dans %s", destination)
     return destination
 
 
@@ -367,19 +416,34 @@ def ecrire_brut(tables: dict[str, pd.DataFrame], run_date: str, ecraser: bool = 
 # ---------------------------------------------------------------------------
 
 def main(arguments: list[str] | None = None) -> int:
+    from senmarket.defauts import DEFAUTS_DE_FICHIER, injecter_defauts, lire_options
     from senmarket.journal import configurer_logging
 
     parseur = argparse.ArgumentParser(description="Génère les données SenMarket dans data/raw/.")
     parseur.add_argument("--run-date", required=True, help="date d'exécution, format AAAA-MM-JJ")
     parseur.add_argument("--rows", type=int, default=10_000, help="nombre de lignes de commande")
     parseur.add_argument("--jours", type=int, default=365, help="nombre de jours couverts")
+    parseur.add_argument("--defauts", nargs="*", default=[], help="défauts à injecter, ou « tous »")
+    parseur.add_argument("--taux", nargs="*", default=[], help="taux d'un défaut, ex. outlier=0.02")
     parseur.add_argument("--ecraser", action="store_true", help="remplace une partition existante")
     args = parseur.parse_args(arguments)
 
     try:
+        actifs, taux = lire_options(args.defauts, args.taux)
         configurer_logging(args.run_date)
+        graine = calculer_graine(args.run_date)
+
         tables = generer_verite(args.run_date, rows=args.rows, jours=args.jours)
-        ecrire_brut(tables, args.run_date, ecraser=args.ecraser)
+        tables, bilan = injecter_defauts(tables, actifs, taux, args.run_date, graine)
+        for ligne in bilan[bilan["lignes_injectees"] > 0].itertuples():
+            logger.info("Défaut %-18s %-16s %-18s %6d lignes",
+                        ligne.defaut, ligne.table, ligne.colonne, ligne.lignes_injectees)
+        if not actifs:
+            logger.info("Aucun défaut injecté (utilise --defauts tous pour en ajouter)")
+
+        ecrire_brut(tables, args.run_date, ecraser=args.ecraser, bilan=bilan,
+                    journal=journal_simule(tables, args.run_date, graine),
+                    defauts_fichier=[d for d in actifs if d in DEFAUTS_DE_FICHIER])
     except (ValueError, FileExistsError) as erreur:
         logger.error("%s", erreur)
         print(f"Erreur : {erreur}", file=sys.stderr)
