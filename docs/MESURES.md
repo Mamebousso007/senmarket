@@ -56,3 +56,11 @@ produits.stock présent : False
 avis.commentaire présent : False
 paiements.reference_transaction présent : False
 ```
+
+## Module 1 — Chapitre 0 : les trois bases démarrées
+```text
+NAME                         IMAGE         COMMAND                  SERVICE    CREATED         STATUS                   PORTS
+senmarket-bases-mongo-1      mongo:7       "docker-entrypoint.s…"   mongo      2 minutes ago   Up 2 minutes (healthy)   127.0.0.1:27017->27017/tcp
+senmarket-bases-postgres-1   postgres:16   "docker-entrypoint.s…"   postgres   2 minutes ago   Up 2 minutes (healthy)   127.0.0.1:5432->5432/tcp
+senmarket-bases-redis-1      redis:7       "docker-entrypoint.s…"   redis      2 minutes ago   Up 2 minutes (healthy)   127.0.0.1:6379->6379/tcp
+```
